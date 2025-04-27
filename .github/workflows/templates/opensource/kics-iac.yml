@@ -1,0 +1,77 @@
+name: KICS IaC Security Analysis
+
+on:
+  workflow_call:
+    inputs:
+      path:
+        required: false
+        type: string
+        description: "Path to scan for IaC files"
+        default: "."
+      output_path:
+        required: false
+        type: string
+        description: "Path to store results"
+        default: "kics-results"
+      output_formats:
+        required: false
+        type: string
+        description: "Report formats (json,sarif,html,pdf)"
+        default: "json,sarif,html"
+      exclude_paths:
+        required: false
+        type: string
+        description: "List of paths to exclude from scan"
+        default: ""
+      exclude_queries:
+        required: false
+        type: string
+        description: "List of queries to exclude"
+        default: ""
+      fail_on:
+        required: false
+        type: string
+        description: "Severity level to fail on (high, medium, low, info)"
+        default: "high"
+      platform_type:
+        required: false
+        type: string
+        description: "IaC platform to scan (terraform, cloudformation, kubernetes, etc)"
+        default: "terraform,cloudformation,kubernetes,dockerfile,ansible"
+      
+jobs:
+  kics-iac-security:
+    name: KICS IaC Security Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Create Results Directory
+        run: mkdir -p ${{ inputs.output_path }}
+
+      - name: Run KICS Scan
+        uses: checkmarx/kics-github-action@v1.7.0
+        with:
+          path: ${{ inputs.path }}
+          output_path: ${{ inputs.output_path }}
+          output_formats: ${{ inputs.output_formats }}
+          platform_type: ${{ inputs.platform_type }}
+          exclude_paths: ${{ inputs.exclude_paths }}
+          exclude_queries: ${{ inputs.exclude_queries }}
+          fail_on: ${{ inputs.fail_on }}
+          output_name: kics-scan-results
+          
+      - name: Upload SARIF Report to GitHub Code Scanning
+        if: contains(inputs.output_formats, 'sarif')
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: ${{ inputs.output_path }}/kics-scan-results.sarif
+          category: "kics-iac"
+
+      - name: Archive Scan Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: kics-scan-results
+          path: ${{ inputs.output_path }}
+          retention-days: 30

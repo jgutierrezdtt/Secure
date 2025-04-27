@@ -1,0 +1,66 @@
+name: Snyk IaC Analysis
+
+on:
+  workflow_call:
+    inputs:
+      iac_path:
+        required: false
+        type: string
+        description: "Path to the IaC files (Terraform, CloudFormation, etc.)"
+        default: "."
+      iac_type:
+        required: false
+        type: string
+        description: "Type of IaC (terraform, cloudformation, kubernetes, arm)"
+        default: "terraform"
+      severity_threshold:
+        required: false
+        type: string
+        description: "Minimum severity level to report (low, medium, high, critical)"
+        default: "high"
+      fail_on_issues:
+        required: false
+        type: boolean
+        description: "Whether to fail the workflow if issues are found"
+        default: true
+      sarif_output:
+        required: false
+        type: boolean
+        description: "Whether to output results as SARIF"
+        default: true
+    secrets:
+      snyk_token:
+        required: true
+        description: "Snyk API token"
+
+jobs:
+  snyk-iac:
+    name: Snyk IaC
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Snyk CLI
+        uses: snyk/actions/setup@master
+
+      - name: Snyk Auth
+        run: snyk auth ${{ secrets.snyk_token }}
+      
+      - name: Run Snyk IaC scan
+        run: |
+          ARGS="--severity-threshold=${{ inputs.severity_threshold }}"
+          
+          ${{ inputs.fail_on_issues && 'ARGS="$ARGS --fail-on=all"' || 'ARGS="$ARGS --fail-on=upgradable"' }}
+          ${{ inputs.sarif_output && 'ARGS="$ARGS --sarif-file-output=snyk-iac-results.sarif"' || '' }}
+          
+          cd ${{ inputs.iac_path }}
+          snyk iac test --${{ inputs.iac_type }} $ARGS .
+        continue-on-error: ${{ !inputs.fail_on_issues }}
+
+      - name: Upload Snyk IaC Report to GitHub Code Scanning
+        if: inputs.sarif_output
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: ${{ inputs.iac_path == '.' && 'snyk-iac-results.sarif' || format('{0}/snyk-iac-results.sarif', inputs.iac_path) }}
+          category: "snyk-iac"

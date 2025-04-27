@@ -1,0 +1,58 @@
+name: Syft SBOM Generation
+
+on:
+  workflow_call:
+    inputs:
+      source:
+        required: false
+        type: string
+        description: "Source to scan (directory path or image name)"
+        default: "."
+      output_format:
+        required: false
+        type: string
+        description: "Output format for SBOM (spdx-json, cyclonedx-json, etc)"
+        default: "spdx-json"
+      output_file:
+        required: false
+        type: string
+        description: "Output file path"
+        default: "sbom.json"
+      image_scan:
+        required: false
+        type: boolean
+        description: "Whether source is a container image"
+        default: false
+
+jobs:
+  syft-sbom:
+    name: Syft SBOM Generation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        if: inputs.image_scan == false
+
+      - name: Set up Docker
+        if: inputs.image_scan
+        uses: docker/setup-buildx-action@v2
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0.14.3
+
+      - name: Generate SBOM for filesystem
+        if: inputs.image_scan == false
+        run: |
+          syft ${{ inputs.source }} -o ${{ inputs.output_format }}=${{ inputs.output_file }}
+
+      - name: Generate SBOM for container image
+        if: inputs.image_scan
+        run: |
+          syft ${{ inputs.source }} -o ${{ inputs.output_format }}=${{ inputs.output_file }}
+
+      - name: Archive SBOM
+        uses: actions/upload-artifact@v3
+        with:
+          name: sbom-report
+          path: ${{ inputs.output_file }}
+          retention-days: 90

@@ -1,0 +1,188 @@
+name: Pipeline Completo de Seguridad
+
+on:
+  # Ejecución programada todos los lunes a medianoche
+  schedule:
+    - cron: '0 0 * * 1'
+  
+  # Ejecución en push a ramas principales
+  push:
+    branches: [ main, master ]
+  
+  # Ejecución en pull requests
+  pull_request:
+    branches: [ main, master ]
+  
+  # Ejecución manual
+  workflow_dispatch:
+    inputs:
+      run_all_scans:
+        type: boolean
+        description: 'Ejecutar todos los análisis (incluso los programados)'
+        default: false
+      include_mobile:
+        type: boolean
+        description: 'Incluir análisis para aplicaciones móviles'
+        default: false
+
+jobs:
+  # Análisis SAST con SonarQube
+  sonarqube-scan:
+    name: "Análisis SAST con SonarQube"
+    uses: ./.github/workflows/templates/commercial/sonar-sast.yml
+    with:
+      sonar_project_key: ${{ github.repository_owner }}-${{ github.event.repository.name }}
+      sonar_organization: ${{ github.repository_owner }}
+      sonar_host_url: ${{ vars.SONAR_HOST_URL || 'https://sonarcloud.io' }}
+    secrets:
+      sonar_token: ${{ secrets.SONAR_TOKEN }}
+
+  # Análisis SCA con Snyk
+  snyk-sca:
+    name: "Análisis de Dependencias (SCA) con Snyk"
+    uses: ./.github/workflows/templates/commercial/snyk-sca.yml
+    secrets:
+      snyk_token: ${{ secrets.SNYK_TOKEN }}
+
+  # Análisis SCA con OWASP Dependency-Check
+  dependency-check:
+    name: "Análisis de Dependencias con OWASP Dependency-Check"
+    uses: ./.github/workflows/templates/opensource/dependency-check.yml
+    with:
+      project_name: ${{ github.repository_owner }}-${{ github.event.repository.name }}
+      scan_path: "."
+      cache_dependencies: true
+
+  # Análisis IaC con KICS
+  kics-iac:
+    name: "Análisis de Infraestructura como Código con KICS"
+    uses: ./.github/workflows/templates/opensource/kics-iac.yml
+    with:
+      path: "."
+      fail_on: "high"
+
+  # Análisis de Contenedores con Snyk
+  snyk-container:
+    name: "Análisis de Contenedores con Snyk"
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.run_all_scans == 'true' || contains(github.event.head_commit.message, 'docker') || contains(github.event.head_commit.message, 'container') }}
+    uses: ./.github/workflows/templates/commercial/snyk-container.yml
+    with:
+      image_name: ${{ github.repository_owner }}/${{ github.event.repository.name }}
+      image_tag: latest
+      fail_on: "high"
+    secrets:
+      snyk_token: ${{ secrets.SNYK_TOKEN }}
+
+  # Análisis IaC con Snyk
+  snyk-iac:
+    name: "Análisis de Infraestructura como Código con Snyk"
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.run_all_scans == 'true' || contains(github.event.head_commit.message, 'terraform') || contains(github.event.head_commit.message, 'iac') }}
+    uses: ./.github/workflows/templates/commercial/snyk-iac.yml
+    with:
+      path: "."
+      severity_threshold: "high"
+    secrets:
+      snyk_token: ${{ secrets.SNYK_TOKEN }}
+
+  # Análisis DAST con OWASP ZAP
+  zap-dast:
+    name: "Análisis Dinámico de Seguridad con OWASP ZAP"
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.run_all_scans == 'true' }}
+    uses: ./.github/workflows/templates/opensource/zap-dast.yml
+    with:
+      target_url: ${{ secrets.TEST_APPLICATION_URL }}
+      scan_type: "baseline"
+      fail_on: "high"
+
+  # Generación de SBOM con Syft
+  syft-sbom:
+    name: "Generación de SBOM con Syft"
+    uses: ./.github/workflows/templates/opensource/syft-sbom.yml
+    with:
+      path: "."
+      output_format: "json,spdx,cyclonedx"
+
+  # Análisis de Cumplimiento
+  compliance-analysis:
+    name: "Análisis de Cumplimiento de Requisitos de Seguridad"
+    needs: [sonarqube-scan, snyk-sca, dependency-check, kics-iac, snyk-container, snyk-iac, zap-dast, syft-sbom]
+    uses: ./.github/workflows/security-compliance-analysis.yml
+    with:
+      sarif_paths: "**/**.sarif"
+      asvs_path: "static/asvs.json"
+      masvs_path: "static/masvs.json"
+      include_mobile: ${{ github.event.inputs.include_mobile == 'true' }}
+      min_severity: "medium"
+
+  # Resumen de Seguridad
+  security-summary:
+    name: "Resumen de Seguridad"
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [sonarqube-scan, snyk-sca, dependency-check, kics-iac, snyk-container, snyk-iac, zap-dast, syft-sbom, compliance-analysis]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: ./security-artifacts
+
+      - name: Generate Security Summary
+        run: |
+          echo "# 📊 Resumen de Seguridad" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📋 Estado de Análisis" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Análisis | Estado | Hallazgos |" >> $GITHUB_STEP_SUMMARY
+          echo "| -------- | ------ | --------- |" >> $GITHUB_STEP_SUMMARY
+          
+          # Análisis SAST
+          if [ "${{ needs.sonarqube-scan.result }}" == "success" ]; then
+            echo "| 🔍 SAST (SonarQube) | ✅ Completado | [Ver Informe](https://sonarcloud.io/dashboard?id=${{ github.repository_owner }}-${{ github.event.repository.name }}) |" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.sonarqube-scan.result }}" == "failure" ]; then
+            echo "| 🔍 SAST (SonarQube) | ❌ Fallido | [Ver Informe](https://sonarcloud.io/dashboard?id=${{ github.repository_owner }}-${{ github.event.repository.name }}) |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| 🔍 SAST (SonarQube) | ⚠️ Saltado | N/A |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Análisis SCA con Snyk
+          if [ "${{ needs.snyk-sca.result }}" == "success" ]; then
+            echo "| 📦 SCA (Snyk) | ✅ Completado | [Ver Informe](https://app.snyk.io/org/${{ github.repository_owner }}) |" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.snyk-sca.result }}" == "failure" ]; then
+            echo "| 📦 SCA (Snyk) | ❌ Fallido | [Ver Informe](https://app.snyk.io/org/${{ github.repository_owner }}) |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| 📦 SCA (Snyk) | ⚠️ Saltado | N/A |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Más análisis similares...
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔒 Cumplimiento de Requisitos" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.compliance-analysis.result }}" == "success" ]; then
+            echo "✅ Análisis de cumplimiento completado sin incumplimientos críticos." >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.compliance-analysis.result }}" == "failure" ]; then
+            echo "❌ Análisis de cumplimiento detectó incumplimientos críticos. Consulte el informe para más detalles." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Análisis de cumplimiento no completado." >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📝 [Ver Informe Completo de Cumplimiento](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})" >> $GITHUB_STEP_SUMMARY
+        shell: bash
+
+      - name: Export Security Summary
+        run: |
+          mkdir -p security-summary
+          cp $GITHUB_STEP_SUMMARY security-summary/security-summary.md
+        shell: bash
+
+      - name: Upload Security Summary
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-summary
+          path: security-summary
+          retention-days: 90

@@ -1,0 +1,701 @@
+name: Análisis de Cumplimiento de Requisitos de Seguridad
+
+on:
+  workflow_call:
+    inputs:
+      sarif_paths:
+        description: 'Rutas a los archivos SARIF generados por herramientas de análisis'
+        type: string
+        required: true
+        default: '**/**.sarif'
+      asvs_path:
+        description: 'Ruta al archivo ASVS JSON'
+        type: string
+        required: true
+        default: 'static/asvs.json'
+      masvs_path:
+        description: 'Ruta al archivo MASVS JSON'
+        type: string
+        required: false
+        default: 'static/masvs.json'
+      include_mobile:
+        description: 'Incluir análisis contra MASVS'
+        type: boolean
+        required: false
+        default: false
+      min_severity:
+        description: 'Severidad mínima para considerar un hallazgo'
+        type: string
+        required: false
+        default: 'medium'
+
+jobs:
+  analyze-compliance:
+    name: Analizar cumplimiento de requisitos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download SARIF artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: ./security-artifacts
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas matplotlib seaborn jinja2 sarif-om
+        shell: bash
+
+      - name: Process SARIF files and map to requirements
+        id: process-files
+        run: |
+          echo "Procesando archivos SARIF y mapeando a requisitos de seguridad..."
+          
+          # Este script Python procesa los archivos SARIF, extrae CWEs y los mapea
+          # a los requisitos de ASVS/MASVS en los archivos JSON
+          python -c '
+          import os
+          import json
+          import glob
+          import pandas as pd
+          import matplotlib.pyplot as plt
+          import seaborn as sns
+          from sarif_om import *
+          from jinja2 import Template
+          from datetime import datetime
+          
+          # Configurar Seaborn
+          sns.set_theme(style="whitegrid")
+          
+          # Cargar mapeo de CWE a requisitos ASVS
+          asvs_path = "${{ inputs.asvs_path }}"
+          with open(asvs_path, "r") as f:
+              asvs_mapping = json.load(f)
+          
+          # Cargar mapeo de CWE a requisitos MASVS si es necesario
+          include_mobile = ${{ inputs.include_mobile }}
+          masvs_mapping = {}
+          if include_mobile:
+              masvs_path = "${{ inputs.masvs_path }}"
+              with open(masvs_path, "r") as f:
+                  masvs_mapping = json.load(f)
+          
+          # Buscar todos los archivos SARIF
+          sarif_files = glob.glob("./security-artifacts/**/${{ inputs.sarif_paths }}", recursive=True)
+          
+          # Extraer hallazgos de todos los archivos SARIF
+          findings = []
+          
+          for sarif_file in sarif_files:
+              try:
+                  with open(sarif_file, "r") as f:
+                      sarif_data = json.load(f)
+                  
+                  # Extraer información de cada resultado
+                  for run in sarif_data.get("runs", []):
+                      tool_name = run.get("tool", {}).get("driver", {}).get("name", "Unknown Tool")
+                      
+                      for result in run.get("results", []):
+                          # Extraer CWE si está disponible
+                          cwe_ids = []
+                          for tag in result.get("taxa", []):
+                              if tag.get("id", "").startswith("CWE-"):
+                                  cwe_ids.append(tag.get("id"))
+                          
+                          # Si no hay CWE en taxa, buscar en ruleId o mensaje
+                          if not cwe_ids:
+                              rule_id = result.get("ruleId", "")
+                              if "CWE" in rule_id:
+                                  # Extraer CWE-NNN del ID de la regla
+                                  import re
+                                  cwe_match = re.search(r"CWE-\d+", rule_id)
+                                  if cwe_match:
+                                      cwe_ids.append(cwe_match.group())
+                          
+                          # Si todavía no hay CWE, intentar en el mensaje
+                          if not cwe_ids and "message" in result:
+                              message = result["message"].get("text", "")
+                              if "CWE" in message:
+                                  import re
+                                  cwe_match = re.search(r"CWE-\d+", message)
+                                  if cwe_match:
+                                      cwe_ids.append(cwe_match.group())
+                          
+                          # Si no se encontraron CWEs, continuar con el siguiente resultado
+                          if not cwe_ids:
+                              continue
+                          
+                          # Determinar la ubicación del problema
+                          locations = result.get("locations", [])
+                          location_str = "Unknown"
+                          
+                          if locations and locations[0].get("physicalLocation"):
+                              physical_loc = locations[0]["physicalLocation"]
+                              if "artifactLocation" in physical_loc:
+                                  file_path = physical_loc["artifactLocation"].get("uri", "")
+                                  
+                                  if "region" in physical_loc:
+                                      start_line = physical_loc["region"].get("startLine", 1)
+                                      location_str = f"{file_path}:{start_line}"
+                                  else:
+                                      location_str = file_path
+                          
+                          # Determinar la severidad
+                          if "level" in result:
+                              severity = result["level"]
+                          else:
+                              # Intentar extraer severidad de las propiedades de la regla
+                              rule_properties = result.get("properties", {})
+                              severity = rule_properties.get("severity", "warning")
+                          
+                          # Mapear nivel de severidad a un valor numérico
+                          severity_map = {
+                              "error": "high",
+                              "warning": "medium",
+                              "note": "low",
+                              "none": "info"
+                          }
+                          
+                          if severity in severity_map:
+                              severity = severity_map[severity]
+                          
+                          # Agregar hallazgo a la lista
+                          for cwe_id in cwe_ids:
+                              findings.append({
+                                  "tool": tool_name,
+                                  "cwe_id": cwe_id,
+                                  "location": location_str,
+                                  "message": result["message"].get("text", "No message"),
+                                  "severity": severity
+                              })
+                          
+              except Exception as e:
+                  print(f"Error al procesar {sarif_file}: {str(e)}")
+          
+          # Filtrar hallazgos por severidad mínima
+          min_severity = "${{ inputs.min_severity }}".lower()
+          severity_levels = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+          min_severity_level = severity_levels.get(min_severity, 1)
+          
+          filtered_findings = [
+              f for f in findings 
+              if severity_levels.get(f["severity"].lower(), 0) >= min_severity_level
+          ]
+          
+          # Mapear CWEs a requisitos ASVS/MASVS
+          asvs_violations = {}
+          masvs_violations = {}
+          
+          for finding in filtered_findings:
+              cwe_id = finding["cwe_id"]
+              cwe_number = cwe_id.replace("CWE-", "")
+              
+              # Mapear a ASVS
+              for req_id, req_info in asvs_mapping.items():
+                  if "cwes" in req_info and cwe_number in req_info["cwes"]:
+                      if req_id not in asvs_violations:
+                          asvs_violations[req_id] = {
+                              "title": req_info.get("title", "Unknown"),
+                              "description": req_info.get("description", ""),
+                              "level": req_info.get("level", "1"),
+                              "findings": []
+                          }
+                      asvs_violations[req_id]["findings"].append(finding)
+              
+              # Mapear a MASVS si está habilitado
+              if include_mobile:
+                  for req_id, req_info in masvs_mapping.items():
+                      if "cwes" in req_info and cwe_number in req_info["cwes"]:
+                          if req_id not in masvs_violations:
+                              masvs_violations[req_id] = {
+                                  "title": req_info.get("title", "Unknown"),
+                                  "description": req_info.get("description", ""),
+                                  "level": req_info.get("level", "L1"),
+                                  "findings": []
+                              }
+                          masvs_violations[req_id]["findings"].append(finding)
+          
+          # Crear estadísticas
+          total_findings = len(filtered_findings)
+          total_asvs_violations = len(asvs_violations)
+          total_masvs_violations = len(masvs_violations) if include_mobile else 0
+          
+          severity_counts = {}
+          for finding in filtered_findings:
+              severity = finding["severity"].lower()
+              if severity not in severity_counts:
+                  severity_counts[severity] = 0
+              severity_counts[severity] += 1
+          
+          tools_counts = {}
+          for finding in filtered_findings:
+              tool = finding["tool"]
+              if tool not in tools_counts:
+                  tools_counts[tool] = 0
+              tools_counts[tool] += 1
+          
+          # Generar gráficos
+          os.makedirs("./compliance-report/images", exist_ok=True)
+          
+          # Gráfico de severidad
+          plt.figure(figsize=(10, 6))
+          colors = {"critical": "#7D0100", "high": "#DC3220", "medium": "#F7A072", "low": "#D5E1A3", "info": "#80B0D3"}
+          severity_df = pd.DataFrame(list(severity_counts.items()), columns=["Severity", "Count"])
+          severity_df = severity_df.sort_values("Count", ascending=False)
+          
+          ax = sns.barplot(x="Severity", y="Count", data=severity_df, palette=colors)
+          plt.title("Distribución de Hallazgos por Severidad")
+          plt.tight_layout()
+          plt.savefig("./compliance-report/images/severity_distribution.png")
+          
+          # Gráfico de herramientas
+          plt.figure(figsize=(12, 6))
+          tools_df = pd.DataFrame(list(tools_counts.items()), columns=["Tool", "Count"])
+          tools_df = tools_df.sort_values("Count", ascending=False)
+          
+          ax = sns.barplot(x="Count", y="Tool", data=tools_df)
+          plt.title("Hallazgos por Herramienta")
+          plt.tight_layout()
+          plt.savefig("./compliance-report/images/tools_distribution.png")
+          
+          # Si hay violaciones de ASVS, generar gráfico por nivel
+          if asvs_violations:
+              asvs_levels = {}
+              for req_id, info in asvs_violations.items():
+                  level = info["level"]
+                  if level not in asvs_levels:
+                      asvs_levels[level] = 0
+                  asvs_levels[level] += 1
+              
+              plt.figure(figsize=(8, 6))
+              asvs_df = pd.DataFrame(list(asvs_levels.items()), columns=["Level", "Count"])
+              asvs_df["Level"] = asvs_df["Level"].astype(str)
+              
+              ax = sns.barplot(x="Level", y="Count", data=asvs_df, palette="Blues_d")
+              plt.title("Requisitos ASVS Incumplidos por Nivel")
+              plt.tight_layout()
+              plt.savefig("./compliance-report/images/asvs_levels.png")
+          
+          # Si hay violaciones de MASVS, generar gráfico por nivel
+          if include_mobile and masvs_violations:
+              masvs_levels = {}
+              for req_id, info in masvs_violations.items():
+                  level = info["level"]
+                  if level not in masvs_levels:
+                      masvs_levels[level] = 0
+                  masvs_levels[level] += 1
+              
+              plt.figure(figsize=(8, 6))
+              masvs_df = pd.DataFrame(list(masvs_levels.items()), columns=["Level", "Count"])
+              
+              ax = sns.barplot(x="Level", y="Count", data=masvs_df, palette="Greens_d")
+              plt.title("Requisitos MASVS Incumplidos por Nivel")
+              plt.tight_layout()
+              plt.savefig("./compliance-report/images/masvs_levels.png")
+          
+          # Generar informe HTML utilizando Jinja2
+          template_str = """
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>Informe de Cumplimiento de Requisitos de Seguridad</title>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <style>
+                  body {
+                      font-family: Arial, sans-serif;
+                      line-height: 1.6;
+                      color: #333;
+                      max-width: 1200px;
+                      margin: 0 auto;
+                      padding: 20px;
+                  }
+                  h1, h2, h3, h4 {
+                      color: #2c3e50;
+                  }
+                  .summary-box {
+                      background-color: #f8f9fa;
+                      border-left: 4px solid #4a6fa5;
+                      padding: 15px;
+                      margin: 20px 0;
+                      border-radius: 0 5px 5px 0;
+                  }
+                  .stats {
+                      display: flex;
+                      flex-wrap: wrap;
+                      justify-content: space-between;
+                      margin: 20px 0;
+                  }
+                  .stat-card {
+                      background-color: #fff;
+                      border: 1px solid #e0e0e0;
+                      border-radius: 5px;
+                      padding: 15px;
+                      width: 22%;
+                      min-width: 200px;
+                      margin-bottom: 15px;
+                      box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+                  }
+                  .stat-card h3 {
+                      margin-top: 0;
+                      color: #4a6fa5;
+                  }
+                  .stat-value {
+                      font-size: 24px;
+                      font-weight: bold;
+                      color: #2c3e50;
+                  }
+                  table {
+                      width: 100%;
+                      border-collapse: collapse;
+                      margin: 20px 0;
+                  }
+                  th, td {
+                      padding: 12px 15px;
+                      text-align: left;
+                      border-bottom: 1px solid #e0e0e0;
+                  }
+                  th {
+                      background-color: #f8f9fa;
+                      font-weight: bold;
+                      color: #2c3e50;
+                  }
+                  tr:hover {
+                      background-color: #f5f5f5;
+                  }
+                  .severity-critical {
+                      color: #7D0100;
+                      font-weight: bold;
+                  }
+                  .severity-high {
+                      color: #DC3220;
+                      font-weight: bold;
+                  }
+                  .severity-medium {
+                      color: #F7A072;
+                  }
+                  .severity-low {
+                      color: #6a8d3f;
+                  }
+                  .severity-info {
+                      color: #80B0D3;
+                  }
+                  .accordion {
+                      background-color: #f8f9fa;
+                      color: #2c3e50;
+                      cursor: pointer;
+                      padding: 18px;
+                      width: 100%;
+                      text-align: left;
+                      border: none;
+                      outline: none;
+                      transition: 0.4s;
+                      border-bottom: 1px solid #e0e0e0;
+                      font-weight: bold;
+                      font-size: 16px;
+                  }
+                  .active, .accordion:hover {
+                      background-color: #e9ecef;
+                  }
+                  .panel {
+                      padding: 0 18px;
+                      background-color: white;
+                      max-height: 0;
+                      overflow: hidden;
+                      transition: max-height 0.2s ease-out;
+                      border-left: 1px solid #e0e0e0;
+                      border-right: 1px solid #e0e0e0;
+                  }
+                  .image-container {
+                      text-align: center;
+                      margin: 20px 0;
+                  }
+                  .image-container img {
+                      max-width: 100%;
+                      height: auto;
+                      border: 1px solid #e0e0e0;
+                      border-radius: 5px;
+                      box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+                  }
+              </style>
+          </head>
+          <body>
+              <h1>Informe de Cumplimiento de Requisitos de Seguridad</h1>
+              <p>Informe generado el {{ date }} para el repositorio {{ repo_name }}</p>
+              
+              <div class="summary-box">
+                  <h2>Resumen Ejecutivo</h2>
+                  <p>Este informe presenta los resultados del análisis de seguridad y cumplimiento de los requisitos de OWASP ASVS{% if include_mobile %} y MASVS{% endif %}.</p>
+                  {% if total_findings > 0 %}
+                  <p>Se han detectado <strong>{{ total_findings }}</strong> hallazgos de seguridad que corresponden a <strong>{{ total_asvs_violations }}</strong> requisitos incumplidos de ASVS{% if include_mobile %} y <strong>{{ total_masvs_violations }}</strong> requisitos incumplidos de MASVS{% endif %}.</p>
+                  {% else %}
+                  <p>No se han detectado hallazgos de seguridad que correspondan a incumplimientos de requisitos ASVS{% if include_mobile %} o MASVS{% endif %}.</p>
+                  {% endif %}
+              </div>
+              
+              {% if total_findings > 0 %}
+              <div class="stats">
+                  <div class="stat-card">
+                      <h3>Total de Hallazgos</h3>
+                      <div class="stat-value">{{ total_findings }}</div>
+                  </div>
+                  <div class="stat-card">
+                      <h3>Requisitos ASVS Incumplidos</h3>
+                      <div class="stat-value">{{ total_asvs_violations }}</div>
+                  </div>
+                  {% if include_mobile %}
+                  <div class="stat-card">
+                      <h3>Requisitos MASVS Incumplidos</h3>
+                      <div class="stat-value">{{ total_masvs_violations }}</div>
+                  </div>
+                  {% endif %}
+                  <div class="stat-card">
+                      <h3>Severidad Máxima</h3>
+                      <div class="stat-value severity-{{ max_severity }}">{{ max_severity|capitalize }}</div>
+                  </div>
+              </div>
+              
+              <h2>Distribución de Hallazgos</h2>
+              
+              <div class="image-container">
+                  <img src="images/severity_distribution.png" alt="Distribución de Hallazgos por Severidad">
+              </div>
+              
+              <div class="image-container">
+                  <img src="images/tools_distribution.png" alt="Hallazgos por Herramienta">
+              </div>
+              
+              {% if asvs_violations %}
+              <div class="image-container">
+                  <img src="images/asvs_levels.png" alt="Requisitos ASVS Incumplidos por Nivel">
+              </div>
+              {% endif %}
+              
+              {% if include_mobile and masvs_violations %}
+              <div class="image-container">
+                  <img src="images/masvs_levels.png" alt="Requisitos MASVS Incumplidos por Nivel">
+              </div>
+              {% endif %}
+              
+              <h2>Requisitos ASVS Incumplidos</h2>
+              
+              {% if asvs_violations %}
+                  {% for req_id, info in asvs_violations.items() %}
+                  <button class="accordion">{{ req_id }}: {{ info.title }} (Nivel {{ info.level }})</button>
+                  <div class="panel">
+                      <p><strong>Descripción:</strong> {{ info.description }}</p>
+                      <h4>Hallazgos relacionados:</h4>
+                      <table>
+                          <tr>
+                              <th>Herramienta</th>
+                              <th>CWE</th>
+                              <th>Severidad</th>
+                              <th>Ubicación</th>
+                              <th>Descripción</th>
+                          </tr>
+                          {% for finding in info.findings %}
+                          <tr>
+                              <td>{{ finding.tool }}</td>
+                              <td>{{ finding.cwe_id }}</td>
+                              <td class="severity-{{ finding.severity }}">{{ finding.severity|capitalize }}</td>
+                              <td>{{ finding.location }}</td>
+                              <td>{{ finding.message }}</td>
+                          </tr>
+                          {% endfor %}
+                      </table>
+                  </div>
+                  {% endfor %}
+              {% else %}
+                  <p>No se han detectado incumplimientos de requisitos ASVS.</p>
+              {% endif %}
+              
+              {% if include_mobile %}
+              <h2>Requisitos MASVS Incumplidos</h2>
+              
+              {% if masvs_violations %}
+                  {% for req_id, info in masvs_violations.items() %}
+                  <button class="accordion">{{ req_id }}: {{ info.title }} ({{ info.level }})</button>
+                  <div class="panel">
+                      <p><strong>Descripción:</strong> {{ info.description }}</p>
+                      <h4>Hallazgos relacionados:</h4>
+                      <table>
+                          <tr>
+                              <th>Herramienta</th>
+                              <th>CWE</th>
+                              <th>Severidad</th>
+                              <th>Ubicación</th>
+                              <th>Descripción</th>
+                          </tr>
+                          {% for finding in info.findings %}
+                          <tr>
+                              <td>{{ finding.tool }}</td>
+                              <td>{{ finding.cwe_id }}</td>
+                              <td class="severity-{{ finding.severity }}">{{ finding.severity|capitalize }}</td>
+                              <td>{{ finding.location }}</td>
+                              <td>{{ finding.message }}</td>
+                          </tr>
+                          {% endfor %}
+                      </table>
+                  </div>
+                  {% endfor %}
+              {% else %}
+                  <p>No se han detectado incumplimientos de requisitos MASVS.</p>
+              {% endif %}
+              {% endif %}
+              {% else %}
+              <div class="stats">
+                  <div class="stat-card">
+                      <h3>Total de Hallazgos</h3>
+                      <div class="stat-value">0</div>
+                  </div>
+                  <div class="stat-card">
+                      <h3>Requisitos ASVS Incumplidos</h3>
+                      <div class="stat-value">0</div>
+                  </div>
+                  {% if include_mobile %}
+                  <div class="stat-card">
+                      <h3>Requisitos MASVS Incumplidos</h3>
+                      <div class="stat-value">0</div>
+                  </div>
+                  {% endif %}
+                  <div class="stat-card">
+                      <h3>Severidad Máxima</h3>
+                      <div class="stat-value">N/A</div>
+                  </div>
+              </div>
+              
+              <h2>¡Felicidades!</h2>
+              <p>No se han detectado incumplimientos de requisitos de seguridad en el código analizado.</p>
+              {% endif %}
+              
+              <script>
+                  document.addEventListener("DOMContentLoaded", function() {
+                      var acc = document.getElementsByClassName("accordion");
+                      for (var i = 0; i < acc.length; i++) {
+                          acc[i].addEventListener("click", function() {
+                              this.classList.toggle("active");
+                              var panel = this.nextElementSibling;
+                              if (panel.style.maxHeight) {
+                                  panel.style.maxHeight = null;
+                              } else {
+                                  panel.style.maxHeight = panel.scrollHeight + "px";
+                              }
+                          });
+                      }
+                  });
+              </script>
+          </body>
+          </html>
+          """
+          
+          # Determinar la severidad máxima
+          max_severity = "info"
+          severity_priority = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+          
+          for finding in filtered_findings:
+              sev = finding["severity"].lower()
+              if severity_priority.get(sev, 0) > severity_priority.get(max_severity, 0):
+                  max_severity = sev
+          
+          # Crear el informe HTML
+          template = Template(template_str)
+          html_report = template.render(
+              date=datetime.now().strftime("%d-%m-%Y %H:%M:%S"),
+              repo_name=os.environ.get("GITHUB_REPOSITORY", "Unknown"),
+              total_findings=total_findings,
+              total_asvs_violations=total_asvs_violations,
+              total_masvs_violations=total_masvs_violations,
+              include_mobile=include_mobile,
+              max_severity=max_severity,
+              asvs_violations=asvs_violations,
+              masvs_violations=masvs_violations
+          )
+          
+          # Guardar el informe HTML
+          with open("./compliance-report/compliance-report.html", "w") as f:
+              f.write(html_report)
+          
+          # Guardar los datos para el resumen del workflow
+          with open("./compliance-report/summary.json", "w") as f:
+              json.dump({
+                  "total_findings": total_findings,
+                  "total_asvs_violations": total_asvs_violations,
+                  "total_masvs_violations": total_masvs_violations,
+                  "max_severity": max_severity,
+                  "severity_counts": severity_counts,
+                  "tools_counts": tools_counts
+              }, f)
+          
+          print(f"Análisis completado: {total_findings} hallazgos, {total_asvs_violations} requisitos ASVS incumplidos")
+          if include_mobile:
+              print(f"{total_masvs_violations} requisitos MASVS incumplidos")
+          '
+        shell: bash
+
+      - name: Generate workflow summary
+        run: |
+          if [ -f "./compliance-report/summary.json" ]; then
+            # Leer los datos del resumen
+            SUMMARY_DATA=$(cat ./compliance-report/summary.json)
+            
+            # Extraer información del resumen
+            TOTAL_FINDINGS=$(echo $SUMMARY_DATA | jq '.total_findings')
+            TOTAL_ASVS=$(echo $SUMMARY_DATA | jq '.total_asvs_violations')
+            TOTAL_MASVS=$(echo $SUMMARY_DATA | jq '.total_masvs_violations')
+            MAX_SEVERITY=$(echo $SUMMARY_DATA | jq -r '.max_severity')
+            
+            # Agregar resumen al paso
+            echo "# 📊 Análisis de Cumplimiento de Requisitos" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            # Mostrar estadísticas
+            echo "## Resumen" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Métrica | Valor |" >> $GITHUB_STEP_SUMMARY
+            echo "| ------- | ----- |" >> $GITHUB_STEP_SUMMARY
+            echo "| Total de Hallazgos | $TOTAL_FINDINGS |" >> $GITHUB_STEP_SUMMARY
+            echo "| Requisitos ASVS Incumplidos | $TOTAL_ASVS |" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "${{ inputs.include_mobile }}" == "true" ]; then
+              echo "| Requisitos MASVS Incumplidos | $TOTAL_MASVS |" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            echo "| Severidad Máxima | $MAX_SEVERITY |" >> $GITHUB_STEP_SUMMARY
+            
+            # Determinar el resultado del análisis
+            if [ "$MAX_SEVERITY" == "high" ] || [ "$MAX_SEVERITY" == "critical" ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "❌ **ATENCIÓN**: Se han detectado incumplimientos de severidad alta o crítica. Revisar el informe completo." >> $GITHUB_STEP_SUMMARY
+              echo "::error::Análisis de cumplimiento detectó incumplimientos de severidad alta o crítica."
+              
+              # Marcar el job como fallido para incumplimientos críticos
+              if [ "$MAX_SEVERITY" == "critical" ]; then
+                exit 1
+              fi
+            elif [ "$TOTAL_FINDINGS" -gt 0 ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "⚠️ **Advertencia**: Se han detectado incumplimientos de requisitos de seguridad." >> $GITHUB_STEP_SUMMARY
+            else
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "✅ **Excelente**: No se han detectado incumplimientos de requisitos de seguridad." >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "No se encontraron datos del análisis de cumplimiento."
+            exit 1
+          fi
+        shell: bash
+
+      - name: Upload compliance report
+        uses: actions/upload-artifact@v3
+        with:
+          name: compliance-report
+          path: ./compliance-report
+          retention-days: 90

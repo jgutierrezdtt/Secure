@@ -1,0 +1,90 @@
+name: OWASP Dependency-Check Analysis
+
+on:
+  workflow_call:
+    inputs:
+      project_name:
+        required: false
+        type: string
+        description: "Project name for the report"
+        default: "dependency-check-report"
+      scan_path:
+        required: false
+        type: string
+        description: "Path to scan for dependencies"
+        default: "."
+      exclude_path:
+        required: false
+        type: string
+        description: "Patterns to exclude from scan (comma-separated)"
+        default: ""
+      scan_only:
+        required: false
+        type: string
+        description: "File extensions to scan (comma-separated)"
+        default: ""
+      cvss_fail_on:
+        required: false
+        type: number
+        description: "Fail if CVSS score is greater than or equal to this value"
+        default: 7
+      sarif_output:
+        required: false
+        type: boolean
+        description: "Enable SARIF output"
+        default: true
+      cache_dependencies:
+        required: false
+        type: boolean
+        description: "Cache dependencies to speed up future scans"
+        default: true
+
+jobs:
+  dependency-check:
+    name: Dependency-Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cache Dependency Check Data
+        if: inputs.cache_dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.dependency-check-data
+          key: ${{ runner.os }}-dependency-check-data
+
+      - name: Dependency-Check Scan
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: ${{ inputs.project_name }}
+          path: ${{ inputs.scan_path }}
+          format: "HTML,JSON,SARIF"
+          out: "dependency-check-reports"
+          args: >
+            --failOnCVSS ${{ inputs.cvss_fail_on }}
+            ${{ inputs.exclude_path != '' && format('--exclude {0}', inputs.exclude_path) || '' }}
+            ${{ inputs.scan_only != '' && format('--scan {0}', inputs.scan_only) || '' }}
+            --disableAssembly
+            --disableAutoconf
+            --disableCmake
+            --disableNodeAudit
+            --disableNodeJS
+            --disablePip
+            --disablePipfile
+            --disablePyDist
+            --disablePyPkg
+
+      - name: Upload SARIF Report to GitHub Code Scanning
+        if: inputs.sarif_output
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: dependency-check-reports/${{ inputs.project_name }}.sarif
+          category: "dependency-check"
+
+      - name: Archive Dependency-Check Reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: dependency-check-reports
+          path: dependency-check-reports
+          retention-days: 30

@@ -1,0 +1,98 @@
+name: SonarQube SAST Analysis
+
+on:
+  workflow_call:
+    inputs:
+      sonar_project_key:
+        required: true
+        type: string
+        description: "SonarQube project key"
+      sonar_organization:
+        required: false
+        type: string
+        description: "SonarQube organization (for SonarCloud)"
+        default: ""
+      sonar_host_url:
+        required: false
+        type: string
+        description: "SonarQube server URL (defaults to SonarCloud)"
+        default: "https://sonarcloud.io"
+      java_version:
+        required: false
+        type: string
+        description: "Java version to use"
+        default: "17"
+      scanner_type:
+        required: false
+        type: string
+        description: "Scanner type to use (maven, gradle, cli)"
+        default: "cli"
+    secrets:
+      sonar_token:
+        required: true
+        description: "SonarQube/SonarCloud authentication token"
+
+jobs:
+  sonarqube-sast:
+    name: SonarQube Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: ${{ inputs.java_version }}
+      
+      - name: Cache SonarQube packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: ${{ runner.os }}-sonar
+
+      - name: Maven-based Analysis
+        if: inputs.scanner_type == 'maven'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.sonar_token }}
+          SONAR_HOST_URL: ${{ inputs.sonar_host_url }}
+        run: |
+          mvn -B verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
+            -Dsonar.projectKey=${{ inputs.sonar_project_key }} \
+            -Dsonar.host.url=${{ inputs.sonar_host_url }} \
+            ${{ inputs.sonar_organization != '' && format('-Dsonar.organization={0}', inputs.sonar_organization) || '' }}
+
+      - name: Gradle-based Analysis
+        if: inputs.scanner_type == 'gradle'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.sonar_token }}
+        run: |
+          ./gradlew sonar \
+            -Dsonar.projectKey=${{ inputs.sonar_project_key }} \
+            -Dsonar.host.url=${{ inputs.sonar_host_url }} \
+            ${{ inputs.sonar_organization != '' && format('-Dsonar.organization={0}', inputs.sonar_organization) || '' }}
+
+      - name: SonarQube CLI Analysis
+        if: inputs.scanner_type == 'cli'
+        uses: SonarSource/sonarqube-scan-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.sonar_token }}
+          SONAR_HOST_URL: ${{ inputs.sonar_host_url }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ inputs.sonar_project_key }}
+            ${{ inputs.sonar_organization != '' && format('-Dsonar.organization={0}', inputs.sonar_organization) || '' }}
+
+      - name: SonarQube Quality Gate check
+        uses: sonarsource/sonarqube-quality-gate-action@master
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.sonar_token }}
+          SONAR_HOST_URL: ${{ inputs.sonar_host_url }}
